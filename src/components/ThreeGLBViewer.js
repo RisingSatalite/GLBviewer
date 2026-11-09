@@ -5,7 +5,49 @@ import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
 
-const frameModel = (loadedModel, camera, controls) => {
+const formatFileSize = (bytes) => {
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ['KB', 'MB', 'GB'];
+  let size = bytes / 1024;
+  let unitIndex = 0;
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex += 1;
+  }
+  return `${size.toFixed(1)} ${units[unitIndex]}`;
+};
+
+const disposeModel = (model) => {
+  const geometries = new Set();
+  const materials = new Set();
+  const textures = new Set();
+
+  model.traverse((object) => {
+    if (object.geometry) geometries.add(object.geometry);
+    if (!object.material) return;
+
+    const objectMaterials = Array.isArray(object.material)
+      ? object.material
+      : [object.material];
+    objectMaterials.forEach((material) => {
+      materials.add(material);
+      Object.values(material).forEach((value) => {
+        if (value?.isTexture) textures.add(value);
+        if (Array.isArray(value)) {
+          value.forEach((item) => {
+            if (item?.isTexture) textures.add(item);
+          });
+        }
+      });
+    });
+  });
+
+  geometries.forEach((geometry) => geometry.dispose());
+  materials.forEach((material) => material.dispose());
+  textures.forEach((texture) => texture.dispose());
+};
+
+const frameModel = (loadedModel, camera, controls, preserveDirection = false) => {
   const bounds = new THREE.Box3().setFromObject(loadedModel);
   if (bounds.isEmpty()) {
     throw new Error('The file loaded but contains no visible 3D geometry.');
@@ -20,7 +62,9 @@ const frameModel = (loadedModel, camera, controls) => {
       radius / Math.sin(verticalFov / 2),
       radius / Math.sin(horizontalFov / 2)
     ) * 1.2;
-  const direction = new THREE.Vector3(1, 0.7, 1).normalize();
+  const direction = preserveDirection
+    ? camera.position.clone().sub(controls.target).normalize()
+    : new THREE.Vector3(1, 0.7, 1).normalize();
 
   camera.position.copy(center).addScaledVector(direction, distance);
   camera.near = Math.max(distance - radius * 2, 0.01);
@@ -36,13 +80,17 @@ const ThreeGLBViewer = () => {
   const cameraRef = useRef(null);
   const controlsRef = useRef(null);
   const dracoLoaderRef = useRef(null);
+  const fileReaderRef = useRef(null);
+  const dragCounterRef = useRef(0);
   const modelRef = useRef(null);
   const modelBaseScaleRef = useRef(null);
   const loadIdRef = useRef(0);
   const [model, setModel] = useState(null);
   const [scale, setScale] = useState(1);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(null);
   const [error, setError] = useState('');
+  const [fileInfo, setFileInfo] = useState(null);
+  const [dragActive, setDragActive] = useState(false);
 
   useEffect(() => {
     const mount = mountRef.current;
@@ -80,7 +128,7 @@ const ThreeGLBViewer = () => {
       camera.aspect = width / height;
       camera.updateProjectionMatrix();
       renderer.setSize(width, height);
-      if (modelRef.current) frameModel(modelRef.current, camera, controls);
+      if (modelRef.current) frameModel(modelRef.current, camera, controls, true);
     };
 
     const resizeObserver = new ResizeObserver(resize);
@@ -97,10 +145,12 @@ const ThreeGLBViewer = () => {
 
     return () => {
       loadIdRef.current += 1;
+      fileReaderRef.current?.abort();
       window.cancelAnimationFrame(animationFrameId);
       resizeObserver.disconnect();
       controls.dispose();
       dracoLoader.dispose();
+      if (modelRef.current) disposeModel(modelRef.current);
       renderer.dispose();
       if (renderer.domElement.parentElement === mount) {
         mount.removeChild(renderer.domElement);
@@ -109,23 +159,51 @@ const ThreeGLBViewer = () => {
       cameraRef.current = null;
       controlsRef.current = null;
       dracoLoaderRef.current = null;
+      fileReaderRef.current = null;
+      modelRef.current = null;
     };
   }, []);
 
-  const handleFileChange = async (event) => {
-    const input = event.currentTarget;
-    const file = input.files?.[0];
+  const handleFile = async (file) => {
     if (!file) return;
-    input.value = '';
-
     const requestId = ++loadIdRef.current;
-    setLoading(true);
+    fileReaderRef.current?.abort();
+    if (!file.name.toLowerCase().endsWith('.glb')) {
+      setLoading(null);
+      setError('Please choose a .glb file.');
+      return;
+    }
+
+    setLoading({ phase: 'Reading file', progress: 0 });
     setError('');
+    setFileInfo({ name: file.name, size: file.size });
 
     try {
-      const data = await file.arrayBuffer();
+      const data = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        fileReaderRef.current = reader;
+        reader.onprogress = (event) => {
+          if (requestId === loadIdRef.current && event.lengthComputable) {
+            setLoading({
+              phase: 'Reading file',
+              progress: Math.round((event.loaded / event.total) * 100),
+            });
+          }
+        };
+        reader.onload = () => {
+          if (reader.result instanceof ArrayBuffer) {
+            resolve(reader.result);
+          } else {
+            reject(new Error('The selected file could not be read as binary data.'));
+          }
+        };
+        reader.onerror = () => reject(reader.error || new Error('Could not read the file.'));
+        reader.onabort = () => reject(new Error('File reading was cancelled.'));
+        reader.readAsArrayBuffer(file);
+      });
       if (requestId !== loadIdRef.current) return;
 
+      setLoading({ phase: 'Parsing model', progress: null });
       const loader = new GLTFLoader();
       loader.setMeshoptDecoder(MeshoptDecoder);
       loader.setDRACOLoader(dracoLoaderRef.current);
@@ -133,14 +211,19 @@ const ThreeGLBViewer = () => {
         data,
         '',
         (gltf) => {
-          if (requestId !== loadIdRef.current) return;
+          if (requestId !== loadIdRef.current) {
+            disposeModel(gltf.scene);
+            return;
+          }
 
           const scene = sceneRef.current;
           const controls = controlsRef.current;
           const camera = cameraRef.current;
-          if (!scene || !controls || !camera) return;
+          if (!scene || !controls || !camera) {
+            disposeModel(gltf.scene);
+            return;
+          }
 
-          if (modelRef.current) scene.remove(modelRef.current);
           const loadedModel = gltf.scene;
           loadedModel.updateMatrixWorld(true);
 
@@ -148,31 +231,70 @@ const ThreeGLBViewer = () => {
             scene.add(loadedModel);
             frameModel(loadedModel, camera, controls);
 
+            const previousModel = modelRef.current;
+            if (previousModel) {
+              scene.remove(previousModel);
+              disposeModel(previousModel);
+            }
             modelRef.current = loadedModel;
             setModel(loadedModel);
             modelBaseScaleRef.current = loadedModel.scale.clone();
             setScale(1);
           } catch (loadError) {
             scene.remove(loadedModel);
-            modelRef.current = null;
-            modelBaseScaleRef.current = null;
-            setModel(null);
-            setLoading(false);
+            disposeModel(loadedModel);
+            setLoading(null);
             setError(loadError instanceof Error ? loadError.message : String(loadError));
             return;
           }
-          setLoading(false);
+          setLoading(null);
         },
         (loadError) => {
           if (requestId !== loadIdRef.current) return;
-          setLoading(false);
+          setLoading(null);
           setError(loadError instanceof Error ? loadError.message : String(loadError));
         }
       );
     } catch (loadError) {
       if (requestId !== loadIdRef.current) return;
-      setLoading(false);
+      setLoading(null);
       setError(loadError instanceof Error ? loadError.message : String(loadError));
+    }
+  };
+
+  const handleFileChange = (event) => {
+    const input = event.currentTarget;
+    const file = input.files?.[0];
+    input.value = '';
+    handleFile(file);
+  };
+
+  const handleDragEnter = (event) => {
+    if (!event.dataTransfer.types.includes('Files')) return;
+    event.preventDefault();
+    dragCounterRef.current += 1;
+    setDragActive(true);
+  };
+
+  const handleDragLeave = (event) => {
+    if (!event.dataTransfer.types.includes('Files')) return;
+    event.preventDefault();
+    dragCounterRef.current = Math.max(0, dragCounterRef.current - 1);
+    if (dragCounterRef.current === 0) setDragActive(false);
+  };
+
+  const handleDrop = (event) => {
+    if (!event.dataTransfer.types.includes('Files')) return;
+    event.preventDefault();
+    dragCounterRef.current = 0;
+    setDragActive(false);
+    const file = Array.from(event.dataTransfer.files).find((item) =>
+      item.name.toLowerCase().endsWith('.glb')
+    );
+    if (file) {
+      handleFile(file);
+    } else {
+      setError('Drop a .glb file to open it.');
     }
   };
 
@@ -183,14 +305,46 @@ const ThreeGLBViewer = () => {
       modelRef.current.scale
         .copy(modelBaseScaleRef.current)
         .multiplyScalar(newScale);
+      if (cameraRef.current) {
+        const bounds = new THREE.Box3().setFromObject(modelRef.current);
+        const radius = Math.max(bounds.getBoundingSphere(new THREE.Sphere()).radius, 0.01);
+        const center = bounds.getCenter(new THREE.Vector3());
+        const distance = cameraRef.current.position.distanceTo(center);
+        cameraRef.current.near = Math.max(distance - radius * 2, 0.01);
+        cameraRef.current.far = distance + radius * 2;
+        cameraRef.current.updateProjectionMatrix();
+      }
     }
   };
 
+  const handleFitModel = (resetScale = false) => {
+    const loadedModel = modelRef.current;
+    const camera = cameraRef.current;
+    const controls = controlsRef.current;
+    if (!loadedModel || !camera || !controls) return;
+    if (resetScale && modelBaseScaleRef.current) {
+      loadedModel.scale.copy(modelBaseScaleRef.current);
+      setScale(1);
+    }
+    frameModel(loadedModel, camera, controls);
+  };
+
   return (
-    <div className="relative h-full w-full overflow-hidden bg-slate-500">
+    <div
+      className="relative h-full w-full overflow-hidden bg-slate-500"
+      onDragEnter={handleDragEnter}
+      onDragOver={(event) => {
+        if (event.dataTransfer.types.includes('Files')) {
+          event.preventDefault();
+          event.dataTransfer.dropEffect = 'copy';
+        }
+      }}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+    >
       <div className="absolute left-4 top-4 z-10 flex flex-col gap-2">
         <label className="w-fit cursor-pointer rounded bg-white px-3 py-2 text-sm text-slate-900 shadow">
-          {loading ? 'Loading model…' : 'Choose a GLB file'}
+          Choose a GLB file
           <input
             type="file"
             accept=".glb,model/gltf-binary"
@@ -198,6 +352,31 @@ const ThreeGLBViewer = () => {
             className="sr-only"
           />
         </label>
+        {loading && (
+          <div
+            className="min-w-52 rounded bg-white/90 px-3 py-2 text-sm text-slate-900 shadow"
+            role="status"
+            aria-live="polite"
+          >
+            <p>
+              {loading.phase}
+              {loading.progress !== null ? `: ${loading.progress}%` : '…'}
+            </p>
+            {loading.progress !== null && (
+              <progress
+                className="mt-1 w-full"
+                value={loading.progress}
+                max="100"
+                aria-label="File read progress"
+              />
+            )}
+          </div>
+        )}
+        {fileInfo && (
+          <p className="max-w-md truncate rounded bg-slate-900/70 px-3 py-2 text-xs text-white">
+            {fileInfo.name} · {formatFileSize(fileInfo.size)}
+          </p>
+        )}
         {error && (
           <p role="alert" className="max-w-md rounded bg-red-950/90 px-3 py-2 text-sm text-white">
             Could not display this file: {error}
@@ -205,8 +384,23 @@ const ThreeGLBViewer = () => {
         )}
       </div>
       <div ref={mountRef} className="h-full w-full" />
+      {dragActive && (
+        <div className="pointer-events-none absolute inset-3 z-20 flex items-center justify-center rounded-xl border-4 border-dashed border-white bg-slate-950/60 text-2xl font-semibold text-white">
+          Drop a GLB file to open it
+        </div>
+      )}
       {model && (
-        <div className="absolute bottom-4 left-1/2 z-10 flex -translate-x-1/2 items-center gap-2 rounded bg-white/90 px-4 py-2 text-sm text-slate-900 shadow">
+        <div className="absolute bottom-4 left-1/2 z-10 flex -translate-x-1/2 flex-wrap items-center justify-center gap-3 rounded bg-white/90 px-4 py-2 text-sm text-slate-900 shadow">
+          <button type="button" onClick={() => handleFitModel()} className="rounded border px-3 py-1">
+            Fit model
+          </button>
+          <button
+            type="button"
+            onClick={() => handleFitModel(true)}
+            className="rounded border px-3 py-1"
+          >
+            Reset view
+          </button>
           <label htmlFor="scale">Scale</label>
           <input
             id="scale"
